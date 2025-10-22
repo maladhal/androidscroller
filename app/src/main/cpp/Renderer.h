@@ -31,9 +31,16 @@ public:
             lastTouchX_(0.0f),
             lastTouchY_(0.0f),
             isScrolling_(false),
+            zoomLevel_(1.0f),
+            minZoom_(0.5f),
+            maxZoom_(3.0f),
+            isPinching_(false),
+            lastPinchDistance_(0.0f),
             selectedTankX_(-1),
             selectedTankY_(-1),
             hasTankSelected_(false) {
+        touch1_.active = false;
+        touch2_.active = false;
         initRenderer();
     }
 
@@ -104,6 +111,25 @@ private:
      * Creates highlight overlay for selected tank
      */
     void createHighlightOverlay();
+    
+    /*!
+     * Helper methods for zoom functionality
+     */
+    float calculateDistance(float x1, float y1, float x2, float y2);
+    void updateProjectionMatrixWithZoom();
+    void convertScreenToWorld(float screenX, float screenY, float& worldX, float& worldY);
+    
+    /*!
+     * Sends highlight request to server when tank is selected
+     */
+    void sendHighlightRequest(int gridX, int gridY);
+    
+    /*!
+     * Gets list of adjacent empty coordinates for a given position
+     * Returns coordinates of all adjacent cells (up, down, left, right, and diagonals)
+     * that are within bounds and contain empty/space values
+     */
+    std::vector<std::pair<int, int>> getAdjacentEmptyCoordinates(int centerX, int centerY) const;
 
     android_app *app_;
     EGLDisplay display_;
@@ -139,6 +165,21 @@ private:
     float lastTouchX_;
     float lastTouchY_;
     bool isScrolling_;
+    
+    // Zoom variables
+    float zoomLevel_;
+    float minZoom_;
+    float maxZoom_;
+    
+    // Multi-touch tracking
+    struct TouchPoint {
+        float x, y;
+        bool active;
+    };
+    TouchPoint touch1_;
+    TouchPoint touch2_;
+    bool isPinching_;
+    float lastPinchDistance_;
     
     // Matrix storage for sharing between shaders
     float projectionMatrix_[16];

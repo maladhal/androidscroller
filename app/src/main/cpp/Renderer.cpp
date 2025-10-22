@@ -6,6 +6,7 @@
 #include <vector>
 #include <android/bitmap.h>
 #include <jni.h>
+#include <cmath>
 
 #include "AndroidOut.h"
 #include "Shader.h"
@@ -141,23 +142,7 @@ void Renderer::render() {
     // even if you change from the sample orthographic projection matrix as your aspect ratio has
     // likely changed.
     if (shaderNeedsNewProjectionMatrix_) {
-        // a placeholder projection matrix allocated on the stack. Column-major memory layout
-        memset(projectionMatrix_, 0, sizeof(projectionMatrix_));
-
-        // build an orthographic projection matrix for 2d rendering
-        Utility::buildOrthographicMatrix(
-                projectionMatrix_,
-                kProjectionHalfHeight,
-                float(width_) / height_,
-                kProjectionNearPlane,
-                kProjectionFarPlane);
-
-        // send the matrix to the shader
-        // Note: the shader must be active for this to work. Since we only have one shader for this
-        // demo, we can assume that it's active.
-        shader_->setProjectionMatrix(projectionMatrix_);
-
-        // make sure the matrix isn't generated every frame
+        updateProjectionMatrixWithZoom();
         shaderNeedsNewProjectionMatrix_ = false;
     }
 
@@ -355,9 +340,9 @@ void Renderer::createModels() {
 void Renderer::downloadMapData() {
     aout << "Starting map data download..." << std::endl;
     
-    // Download CSV map data
-    if (NetworkDownloader::downloadCSV("http://nasmo2.myqnapcloud.com:8585/maps/map1.csv", mapData_)) {
-        aout << "Map CSV downloaded successfully" << std::endl;
+    // Download JSON map data from the new endpoint
+    if (NetworkDownloader::downloadJSON("http://nasmo2.myqnapcloud.com:8585/tanks/index.php", mapData_)) {
+        aout << "Map JSON downloaded successfully" << std::endl;
         
         // Download tank image
         if (NetworkDownloader::downloadImage("http://nasmo2.myqnapcloud.com:8585/maps/tank.png", tankImageData_)) {
@@ -385,6 +370,9 @@ void Renderer::downloadMapData() {
                     if (cell == 'x' || cell == 'X') {
                         aout << "Tank found at (" << x << ", " << y << ")" << std::endl;
                     }
+                    if (cell == 'o' || cell == 'O') {
+                        aout << "Object found at (" << x << ", " << y << ")" << std::endl;
+                    }
                 }
                 aout << "Row " << y << ": '" << row << "'" << std::endl;
             }
@@ -398,7 +386,7 @@ void Renderer::downloadMapData() {
             createFallbackMapData();
         }
     } else {
-        aout << "Failed to download map CSV, using fallback data" << std::endl;
+        aout << "Failed to download map JSON, using fallback data" << std::endl;
         createFallbackMapData();
     }
 }
@@ -406,18 +394,20 @@ void Renderer::downloadMapData() {
 void Renderer::createFallbackMapData() {
     aout << "Creating fallback map data for demonstration" << std::endl;
     
-    // Create a test map with various cell types including tanks (x)
-    mapData_.width = 12;
-    mapData_.height = 8;
+    // Create a test map with various cell types including tanks (x) and objects (o)
+    mapData_.width = 10;
+    mapData_.height = 10;
     mapData_.data = {
-        ' ', '1', '1', ' ', ' ', '2', '2', ' ', ' ', '3', '3', ' ',
-        '1', '1', 'x', '1', ' ', '2', 'x', '2', ' ', '3', '3', '3',
-        ' ', '1', '1', ' ', ' ', '2', '2', ' ', ' ', '3', 'x', '3',
-        ' ', ' ', ' ', ' ', '3', '3', '3', '3', ' ', ' ', ' ', ' ',
-        'x', ' ', '1', '1', '3', '3', '3', '3', '2', '2', ' ', 'x',
-        ' ', ' ', '1', '1', '3', 'x', 'x', '3', '2', '2', ' ', ' ',
-        ' ', '1', '1', ' ', ' ', '3', '3', ' ', ' ', '2', '2', ' ',
-        '1', 'x', '1', ' ', ' ', '3', '3', ' ', ' ', '2', 'x', '2'
+        'x', 'x', ' ', 'x', ' ', ' ', ' ', ' ', ' ', 'x',
+        ' ', ' ', 'o', 'o', ' ', ' ', 'x', ' ', ' ', ' ',
+        ' ', ' ', ' ', ' ', ' ', 'x', ' ', ' ', ' ', ' ',
+        ' ', ' ', ' ', ' ', ' ', ' ', ' ', 'x', ' ', ' ',
+        ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
+        ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', 'x', ' ',
+        ' ', ' ', ' ', ' ', ' ', ' ', ' ', 'x', ' ', ' ',
+        ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
+        ' ', ' ', ' ', 'x', ' ', ' ', ' ', ' ', ' ', ' ',
+        ' ', ' ', ' ', ' ', 'x', ' ', ' ', ' ', ' ', ' '
     };
     
     mapDataLoaded_ = true;
@@ -426,7 +416,7 @@ void Renderer::createFallbackMapData() {
     models_.clear();
     createColoredGrid();
     
-    aout << "Fallback map created: " << mapData_.width << "x" << mapData_.height << " with tank positions marked as 'x'" << std::endl;
+    aout << "Fallback map created: " << mapData_.width << "x" << mapData_.height << " with tank positions ('x') and objects ('o')" << std::endl;
 }
 
 void Renderer::createColoredGrid() {
@@ -460,6 +450,10 @@ void Renderer::createColoredGrid() {
                     case 'X':
                         cellColor = {1.0f, 0.0f, 0.0f}; // Red for tank positions
                         break;
+                    case 'o':
+                    case 'O':
+                        cellColor = {1.0f, 0.5f, 0.0f}; // Orange for objects
+                        break;
                     case '1':
                         cellColor = {0.0f, 1.0f, 0.0f}; // Green
                         break;
@@ -480,7 +474,7 @@ void Renderer::createColoredGrid() {
                 float cellY = gridExtent - (y + 0.5f) * gridSpacing;
                 float cellSize = gridSpacing * 0.8f; // Make cells slightly smaller than grid spacing
                 
-                // For tank positions, create textured quads; for others, just outline
+                // For tank positions, create textured quads; for objects, create filled squares; for others, just outline
                 if (cellType == 'x' || cellType == 'X') {
                     // Create a textured quad for tank position
                     Index baseIndex = texturedVertices.size();
@@ -494,6 +488,19 @@ void Renderer::createColoredGrid() {
                     // Add triangle indices for textured quad (two triangles)
                     texturedIndices.push_back(baseIndex);     texturedIndices.push_back(baseIndex + 1); texturedIndices.push_back(baseIndex + 2); // First triangle
                     texturedIndices.push_back(baseIndex);     texturedIndices.push_back(baseIndex + 2); texturedIndices.push_back(baseIndex + 3); // Second triangle
+                } else if (cellType == 'o' || cellType == 'O') {
+                    // Create filled triangles for objects
+                    Index baseIndex = triangleVertices.size();
+                    
+                    // Add vertices for filled square (two triangles)
+                    triangleVertices.emplace_back(Vector3{cellX - cellSize/2, cellY + cellSize/2, 0}, cellColor); // Top-left
+                    triangleVertices.emplace_back(Vector3{cellX + cellSize/2, cellY + cellSize/2, 0}, cellColor); // Top-right
+                    triangleVertices.emplace_back(Vector3{cellX + cellSize/2, cellY - cellSize/2, 0}, cellColor); // Bottom-right
+                    triangleVertices.emplace_back(Vector3{cellX - cellSize/2, cellY - cellSize/2, 0}, cellColor); // Bottom-left
+                    
+                    // Add triangle indices for filled quad (two triangles)
+                    triangleIndices.push_back(baseIndex);     triangleIndices.push_back(baseIndex + 1); triangleIndices.push_back(baseIndex + 2); // First triangle
+                    triangleIndices.push_back(baseIndex);     triangleIndices.push_back(baseIndex + 2); triangleIndices.push_back(baseIndex + 3); // Second triangle
                 } else {
                     // Create outline for other cell types
                     Index baseIndex = lineVertices.size();
@@ -587,59 +594,161 @@ void Renderer::handleInput() {
         auto pointerIndex = (action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK)
                 >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
 
-        // get the x and y position of this event if it is not ACTION_MOVE.
-        auto &pointer = motionEvent.pointers[pointerIndex];
-        auto x = GameActivityPointerAxes_getX(&pointer);
-        auto y = GameActivityPointerAxes_getY(&pointer);
-
-        // Convert screen coordinates to world coordinates matching the orthographic projection
-        // The projection uses halfHeight = 2.0f, so Y range is [-2, 2]
-        // X range is [-2*aspect, 2*aspect] where aspect = width/height
-        float aspect = float(width_) / float(height_);
-        float halfHeight = kProjectionHalfHeight; // Use the same constant as projection
-        float halfWidth = halfHeight * aspect;
-        
-        float normalizedX = ((x / float(width_)) * 2.0f - 1.0f) * halfWidth;
-        float normalizedY = -(((y / float(height_)) * 2.0f - 1.0f) * halfHeight); // Flip Y axis
+        int pointerCount = motionEvent.pointerCount;
 
         // determine the action type and process the event accordingly.
         switch (action & AMOTION_EVENT_ACTION_MASK) {
-            case AMOTION_EVENT_ACTION_DOWN:
-            case AMOTION_EVENT_ACTION_POINTER_DOWN:
-                lastTouchX_ = normalizedX;
-                lastTouchY_ = normalizedY;
+            case AMOTION_EVENT_ACTION_DOWN: {
+                // First finger down
+                auto &pointer = motionEvent.pointers[0];
+                auto x = GameActivityPointerAxes_getX(&pointer);
+                auto y = GameActivityPointerAxes_getY(&pointer);
+                
+                convertScreenToWorld(x, y, touch1_.x, touch1_.y);
+                touch1_.active = true;
+                touch2_.active = false;
+                isPinching_ = false;
                 isScrolling_ = true;
                 
-                // Check for tank selection on touch down
-                checkTankSelection(normalizedX, normalizedY);
+                lastTouchX_ = touch1_.x;
+                lastTouchY_ = touch1_.y;
                 
-                aout << "Touch Down: (" << normalizedX << ", " << normalizedY << ")" << std::endl;
+                // Check for tank selection on single touch down
+                checkTankSelection(touch1_.x, touch1_.y);
+                
+                aout << "Touch Down: (" << touch1_.x << ", " << touch1_.y << ")" << std::endl;
                 break;
-
-            case AMOTION_EVENT_ACTION_CANCEL:
-            case AMOTION_EVENT_ACTION_UP:
-            case AMOTION_EVENT_ACTION_POINTER_UP:
-                isScrolling_ = false;
-                aout << "Touch Up: (" << normalizedX << ", " << normalizedY << ")" << std::endl;
-                break;
-
-            case AMOTION_EVENT_ACTION_MOVE:
-                if (isScrolling_) {
-                    // Calculate the delta movement
-                    float deltaX = normalizedX - lastTouchX_;
-                    float deltaY = normalizedY - lastTouchY_;
+            }
+            
+            case AMOTION_EVENT_ACTION_POINTER_DOWN: {
+                // Second finger down - start pinch gesture
+                if (pointerCount >= 2) {
+                    auto &pointer1 = motionEvent.pointers[0];
+                    auto &pointer2 = motionEvent.pointers[1];
                     
-                    // Update scroll position (no additional scaling needed since delta is already in world coordinates)
+                    float x1 = GameActivityPointerAxes_getX(&pointer1);
+                    float y1 = GameActivityPointerAxes_getY(&pointer1);
+                    float x2 = GameActivityPointerAxes_getX(&pointer2);
+                    float y2 = GameActivityPointerAxes_getY(&pointer2);
+                    
+                    convertScreenToWorld(x1, y1, touch1_.x, touch1_.y);
+                    convertScreenToWorld(x2, y2, touch2_.x, touch2_.y);
+                    
+                    touch1_.active = true;
+                    touch2_.active = true;
+                    isPinching_ = true;
+                    isScrolling_ = false;
+                    
+                    lastPinchDistance_ = calculateDistance(touch1_.x, touch1_.y, touch2_.x, touch2_.y);
+                    
+                    aout << "Pinch Start: distance=" << lastPinchDistance_ << std::endl;
+                }
+                break;
+            }
+
+            case AMOTION_EVENT_ACTION_UP:
+            case AMOTION_EVENT_ACTION_CANCEL: {
+                // All fingers up
+                touch1_.active = false;
+                touch2_.active = false;
+                isPinching_ = false;
+                isScrolling_ = false;
+                aout << "All Touch Up" << std::endl;
+                break;
+            }
+            
+            case AMOTION_EVENT_ACTION_POINTER_UP: {
+                // One finger up - end pinch, potentially start scroll
+                if (isPinching_) {
+                    isPinching_ = false;
+                    
+                    // Determine which finger is still down
+                    if (pointerIndex == 0) {
+                        // First finger up, second still down
+                        auto &pointer = motionEvent.pointers[1];
+                        auto x = GameActivityPointerAxes_getX(&pointer);
+                        auto y = GameActivityPointerAxes_getY(&pointer);
+                        convertScreenToWorld(x, y, touch1_.x, touch1_.y);
+                        touch2_.active = false;
+                    } else {
+                        // Second finger up, first still down
+                        auto &pointer = motionEvent.pointers[0];
+                        auto x = GameActivityPointerAxes_getX(&pointer);
+                        auto y = GameActivityPointerAxes_getY(&pointer);
+                        convertScreenToWorld(x, y, touch1_.x, touch1_.y);
+                        touch2_.active = false;
+                    }
+                    
+                    lastTouchX_ = touch1_.x;
+                    lastTouchY_ = touch1_.y;
+                    isScrolling_ = true;
+                    
+                    aout << "Pinch End - Switch to scroll" << std::endl;
+                } else {
+                    touch1_.active = false;
+                    touch2_.active = false;
+                    isScrolling_ = false;
+                }
+                break;
+            }
+
+            case AMOTION_EVENT_ACTION_MOVE: {
+                if (isPinching_ && pointerCount >= 2) {
+                    // Handle pinch zoom
+                    auto &pointer1 = motionEvent.pointers[0];
+                    auto &pointer2 = motionEvent.pointers[1];
+                    
+                    float x1 = GameActivityPointerAxes_getX(&pointer1);
+                    float y1 = GameActivityPointerAxes_getY(&pointer1);
+                    float x2 = GameActivityPointerAxes_getX(&pointer2);
+                    float y2 = GameActivityPointerAxes_getY(&pointer2);
+                    
+                    convertScreenToWorld(x1, y1, touch1_.x, touch1_.y);
+                    convertScreenToWorld(x2, y2, touch2_.x, touch2_.y);
+                    
+                    float currentDistance = calculateDistance(touch1_.x, touch1_.y, touch2_.x, touch2_.y);
+                    
+                    if (lastPinchDistance_ > 0.0f) {
+                        float scale = currentDistance / lastPinchDistance_;
+                        float newZoom = zoomLevel_ * scale;
+                        
+                        // Clamp zoom level
+                        if (newZoom >= minZoom_ && newZoom <= maxZoom_) {
+                            zoomLevel_ = newZoom;
+                            shaderNeedsNewProjectionMatrix_ = true;
+                            
+                            aout << "Zoom: " << zoomLevel_ << " (scale=" << scale << ", dist=" << currentDistance << ")" << std::endl;
+                        }
+                    }
+                    
+                    lastPinchDistance_ = currentDistance;
+                    
+                } else if (isScrolling_ && !isPinching_) {
+                    // Handle single finger scroll
+                    auto &pointer = motionEvent.pointers[0];
+                    auto x = GameActivityPointerAxes_getX(&pointer);
+                    auto y = GameActivityPointerAxes_getY(&pointer);
+                    
+                    float worldX, worldY;
+                    convertScreenToWorld(x, y, worldX, worldY);
+                    
+                    // Calculate the delta movement
+                    float deltaX = worldX - lastTouchX_;
+                    float deltaY = worldY - lastTouchY_;
+                    
+                    // Update scroll position
                     scrollX_ += deltaX;
                     scrollY_ += deltaY;
                     
                     // Update last touch position
-                    lastTouchX_ = normalizedX;
-                    lastTouchY_ = normalizedY;
+                    lastTouchX_ = worldX;
+                    lastTouchY_ = worldY;
                     
                     aout << "Scroll: (" << scrollX_ << ", " << scrollY_ << ")" << std::endl;
                 }
                 break;
+            }
+            
             default:
                 aout << "Unknown MotionEvent Action: " << action << std::endl;
         }
@@ -827,7 +936,7 @@ void Renderer::checkTankSelection(float worldX, float worldY) {
     int gy = (int)round(gridY);
     
     aout << "Touch conversion: world(" << worldX << ", " << worldY << ") -> adjusted(" << adjustedWorldX << ", " << adjustedWorldY << ") -> grid_float(" << gridX << ", " << gridY << ") -> grid_int(" << gx << ", " << gy << ")" << std::endl;
-    aout << "Grid extent: " << gridExtent << ", Grid spacing: " << gridSpacing << ", Scroll: (" << scrollX_ << ", " << scrollY_ << ")" << std::endl;
+    aout << "Grid extent: " << gridExtent << ", Grid spacing: " << gridSpacing << ", Scroll: (" << scrollX_ << ", " << scrollY_ << "), Zoom: " << zoomLevel_ << std::endl;
     
     // Debug: show expected cell center for this grid position
     if (gx >= 0 && gx < mapData_.width && gy >= 0 && gy < mapData_.height) {
@@ -858,6 +967,9 @@ void Renderer::checkTankSelection(float worldX, float worldY) {
             
             // Create highlight overlay for selected tank
             createHighlightOverlay();
+            
+            // Send highlight request to server
+            sendHighlightRequest(gx, gy);
         } else {
             // No tank at this position, clear selection
             aout << "No tank found - clearing selection" << std::endl;
@@ -932,4 +1044,74 @@ void Renderer::createHighlightOverlay() {
         aout << "ERROR: No highlight vertices created!" << std::endl;
     }
     aout << "=== END HIGHLIGHT CREATION ===" << std::endl;
+}
+
+float Renderer::calculateDistance(float x1, float y1, float x2, float y2) {
+    float dx = x2 - x1;
+    float dy = y2 - y1;
+    return sqrt(dx * dx + dy * dy);
+}
+
+void Renderer::updateProjectionMatrixWithZoom() {
+    // Clear the projection matrix
+    memset(projectionMatrix_, 0, sizeof(projectionMatrix_));
+
+    // Apply zoom to the projection matrix by scaling the half height
+    float zoomedHalfHeight = kProjectionHalfHeight / zoomLevel_;
+    
+    // Build an orthographic projection matrix for 2d rendering with zoom
+    Utility::buildOrthographicMatrix(
+            projectionMatrix_,
+            zoomedHalfHeight,
+            float(width_) / height_,
+            kProjectionNearPlane,
+            kProjectionFarPlane);
+
+    // Send the matrix to all shaders
+    shader_->setProjectionMatrix(projectionMatrix_);
+    if (triangleShader_) {
+        triangleShader_->setProjectionMatrix(projectionMatrix_);
+    }
+    if (textureShader_) {
+        textureShader_->setProjectionMatrix(projectionMatrix_);
+    }
+    
+    aout << "Updated projection matrix with zoom level: " << zoomLevel_ << std::endl;
+}
+
+void Renderer::convertScreenToWorld(float screenX, float screenY, float& worldX, float& worldY) {
+    // Convert screen coordinates to world coordinates with zoom support
+    float aspect = float(width_) / float(height_);
+    float zoomedHalfHeight = kProjectionHalfHeight / zoomLevel_;
+    float zoomedHalfWidth = zoomedHalfHeight * aspect;
+    
+    float normalizedX = ((screenX / float(width_)) * 2.0f - 1.0f) * zoomedHalfWidth;
+    float normalizedY = -(((screenY / float(height_)) * 2.0f - 1.0f) * zoomedHalfHeight);
+    
+    worldX = normalizedX;
+    worldY = normalizedY;
+}
+
+void Renderer::sendHighlightRequest(int gridX, int gridY) {
+    aout << "Sending highlight request for grid position (" << gridX << ", " << gridY << ")" << std::endl;
+    
+    // Create JSON payload
+    std::string jsonPayload = "{\n";
+    jsonPayload += "    \"x\": " + std::to_string(gridX) + ",\n";
+    jsonPayload += "    \"y\": " + std::to_string(gridY) + ",\n";
+    jsonPayload += "    \"value\": \"XH\"\n";
+    jsonPayload += "}";
+    
+    aout << "JSON payload: " << jsonPayload << std::endl;
+    
+    // Send POST request
+    std::string response;
+    bool success = NetworkDownloader::postJSON("http://nasmo2.myqnapcloud.com:8585/tanks/index.php", jsonPayload, response);
+    
+    if (success) {
+        aout << "Highlight request sent successfully!" << std::endl;
+        aout << "Server response: " << response << std::endl;
+    } else {
+        aout << "Failed to send highlight request" << std::endl;
+    }
 }
