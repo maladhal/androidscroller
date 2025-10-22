@@ -10,7 +10,7 @@ android {
 
     defaultConfig {
         applicationId = "com.example.scroller"
-        minSdk = 30
+        minSdk = 24  // Lowered from 30 to support Android 7.0+
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"

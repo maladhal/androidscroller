@@ -4,10 +4,13 @@
 #include <GLES3/gl3.h>
 #include <memory>
 #include <vector>
+#include <android/bitmap.h>
+#include <jni.h>
 
 #include "AndroidOut.h"
 #include "Shader.h"
 #include "Utility.h"
+#include "NetworkDownloader.h"
 
 //! executes glGetString and outputs the result to logcat
 #define PRINT_GL_STRING(s) {aout << #s": "<< glGetString(s) << std::endl;}
@@ -63,6 +66,37 @@ void main() {
 }
 )fragment";
 
+// Vertex shader for textured quads
+static const char *textureVertex = R"vertex(#version 300 es
+in vec3 inPosition;
+in vec2 inTexCoord;
+
+out vec2 fragTexCoord;
+
+uniform mat4 uModel;
+uniform mat4 uProjection;
+
+void main() {
+    fragTexCoord = inTexCoord;
+    gl_Position = uProjection * uModel * vec4(inPosition, 1.0);
+}
+)vertex";
+
+// Fragment shader for textured quads
+static const char *textureFragment = R"fragment(#version 300 es
+precision mediump float;
+
+in vec2 fragTexCoord;
+
+out vec4 outColor;
+
+uniform sampler2D uTexture;
+
+void main() {
+    outColor = texture(uTexture, fragTexCoord);
+}
+)fragment";
+
 /*!
  * Half the height of the projection matrix. This gives you a renderable area of height 4 ranging
  * from -2 to 2
@@ -108,11 +142,11 @@ void Renderer::render() {
     // likely changed.
     if (shaderNeedsNewProjectionMatrix_) {
         // a placeholder projection matrix allocated on the stack. Column-major memory layout
-        float projectionMatrix[16] = {0};
+        memset(projectionMatrix_, 0, sizeof(projectionMatrix_));
 
         // build an orthographic projection matrix for 2d rendering
         Utility::buildOrthographicMatrix(
-                projectionMatrix,
+                projectionMatrix_,
                 kProjectionHalfHeight,
                 float(width_) / height_,
                 kProjectionNearPlane,
@@ -121,16 +155,16 @@ void Renderer::render() {
         // send the matrix to the shader
         // Note: the shader must be active for this to work. Since we only have one shader for this
         // demo, we can assume that it's active.
-        shader_->setProjectionMatrix(projectionMatrix);
+        shader_->setProjectionMatrix(projectionMatrix_);
 
         // make sure the matrix isn't generated every frame
         shaderNeedsNewProjectionMatrix_ = false;
     }
 
     // Create model matrix with scroll translation
-    float modelMatrix[16] = {0};
-    Utility::buildTranslationMatrix(modelMatrix, scrollX_, scrollY_);
-    shader_->setModelMatrix(modelMatrix);
+    memset(modelMatrix_, 0, sizeof(modelMatrix_));
+    Utility::buildTranslationMatrix(modelMatrix_, scrollX_, scrollY_);
+    shader_->setModelMatrix(modelMatrix_);
 
     // clear the color buffer
     glClear(GL_COLOR_BUFFER_BIT);
@@ -140,6 +174,41 @@ void Renderer::render() {
     // configure it at the end of initRenderer
     if (!models_.empty()) {
         for (const auto &model: models_) {
+            shader_->drawModel(model);
+        }
+    }
+    
+    // Render triangle models with triangle shader
+    if (!triangleModels_.empty()) {
+        triangleShader_->activate();
+        triangleShader_->setProjectionMatrix(projectionMatrix_);
+        triangleShader_->setModelMatrix(modelMatrix_);
+        
+        for (const auto &model: triangleModels_) {
+            triangleShader_->drawTriangles(model);
+        }
+        
+        shader_->activate(); // Switch back to line shader
+    }
+    
+    // Render textured models (tanks) with texture shader
+    if (!texturedModels_.empty() && tankTextureLoaded_) {
+        textureShader_->activate();
+        textureShader_->setProjectionMatrix(projectionMatrix_);
+        textureShader_->setModelMatrix(modelMatrix_);
+        textureShader_->setTexture(tankTextureId_);
+        
+        for (const auto &model: texturedModels_) {
+            textureShader_->drawTexturedModel(model);
+        }
+        
+        shader_->activate(); // Switch back to line shader
+    }
+    
+    // Render highlight overlay on top of everything
+    if (!highlightModels_.empty()) {
+        // Use line shader for highlight border, keep current matrices
+        for (const auto &model: highlightModels_) {
             shader_->drawModel(model);
         }
     }
@@ -226,6 +295,14 @@ void Renderer::initRenderer() {
             Shader::loadShader(vertex, fragment, "inPosition", "inColor", "uModel", "uProjection"));
     assert(shader_);
 
+    triangleShader_ = std::unique_ptr<Shader>(
+            Shader::loadShader(vertex, fragment, "inPosition", "inColor", "uModel", "uProjection"));
+    assert(triangleShader_);
+
+    textureShader_ = std::unique_ptr<TextureShader>(
+            TextureShader::loadShader(textureVertex, textureFragment, "inPosition", "inTexCoord", "uModel", "uProjection", "uTexture"));
+    assert(textureShader_);
+
     // Note: there's only one shader in this demo, so I'll activate it here. For a more complex game
     // you'll want to track the active shader and activate/deactivate it as necessary
     shader_->activate();
@@ -236,9 +313,18 @@ void Renderer::initRenderer() {
     // enable alpha globally for now, you probably don't want to do this in a game
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
+    // Initialize texture variables
+    tankTextureId_ = 0;
+    tankTextureWidth_ = 0;
+    tankTextureHeight_ = 0;
+    tankTextureLoaded_ = false;
 
     // get some demo models into memory
     createModels();
+    
+    // Download map data in a separate thread to avoid blocking
+    downloadMapData();
 }
 
 void Renderer::updateRenderArea() {
@@ -262,47 +348,226 @@ void Renderer::updateRenderArea() {
  * @brief Create a 2D grid for rendering.
  */
 void Renderer::createModels() {
+    // Create basic grid first - this will be replaced when map data loads
+    createColoredGrid();
+}
+
+void Renderer::downloadMapData() {
+    aout << "Starting map data download..." << std::endl;
+    
+    // Download CSV map data
+    if (NetworkDownloader::downloadCSV("http://nasmo2.myqnapcloud.com:8585/maps/map1.csv", mapData_)) {
+        aout << "Map CSV downloaded successfully" << std::endl;
+        
+        // Download tank image
+        if (NetworkDownloader::downloadImage("http://nasmo2.myqnapcloud.com:8585/maps/tank.png", tankImageData_)) {
+            aout << "Tank image downloaded successfully" << std::endl;
+            
+            // Decode PNG to texture
+            if (decodePNGToTexture()) {
+                aout << "Tank texture loaded successfully" << std::endl;
+            } else {
+                aout << "Failed to decode tank PNG, using colored squares" << std::endl;
+            }
+            
+            mapDataLoaded_ = true;
+            
+            // Debug: Print the entire map for analysis
+            aout << "=== MAP DATA DEBUG ===" << std::endl;
+            aout << "Map size: " << mapData_.width << "x" << mapData_.height << std::endl;
+            aout << "Total cells: " << mapData_.data.size() << std::endl;
+            aout << "Map content:" << std::endl;
+            for (int y = 0; y < mapData_.height; y++) {
+                std::string row = "";
+                for (int x = 0; x < mapData_.width; x++) {
+                    char cell = mapData_.data[y * mapData_.width + x];
+                    row += cell;
+                    if (cell == 'x' || cell == 'X') {
+                        aout << "Tank found at (" << x << ", " << y << ")" << std::endl;
+                    }
+                }
+                aout << "Row " << y << ": '" << row << "'" << std::endl;
+            }
+            aout << "=== END MAP DEBUG ===" << std::endl;
+            
+            // Recreate models with map data
+            models_.clear();
+            createColoredGrid();
+        } else {
+            aout << "Failed to download tank image, using fallback data" << std::endl;
+            createFallbackMapData();
+        }
+    } else {
+        aout << "Failed to download map CSV, using fallback data" << std::endl;
+        createFallbackMapData();
+    }
+}
+
+void Renderer::createFallbackMapData() {
+    aout << "Creating fallback map data for demonstration" << std::endl;
+    
+    // Create a test map with various cell types including tanks (x)
+    mapData_.width = 12;
+    mapData_.height = 8;
+    mapData_.data = {
+        ' ', '1', '1', ' ', ' ', '2', '2', ' ', ' ', '3', '3', ' ',
+        '1', '1', 'x', '1', ' ', '2', 'x', '2', ' ', '3', '3', '3',
+        ' ', '1', '1', ' ', ' ', '2', '2', ' ', ' ', '3', 'x', '3',
+        ' ', ' ', ' ', ' ', '3', '3', '3', '3', ' ', ' ', ' ', ' ',
+        'x', ' ', '1', '1', '3', '3', '3', '3', '2', '2', ' ', 'x',
+        ' ', ' ', '1', '1', '3', 'x', 'x', '3', '2', '2', ' ', ' ',
+        ' ', '1', '1', ' ', ' ', '3', '3', ' ', ' ', '2', '2', ' ',
+        '1', 'x', '1', ' ', ' ', '3', '3', ' ', ' ', '2', 'x', '2'
+    };
+    
+    mapDataLoaded_ = true;
+    
+    // Recreate models with fallback data
+    models_.clear();
+    createColoredGrid();
+    
+    aout << "Fallback map created: " << mapData_.width << "x" << mapData_.height << " with tank positions marked as 'x'" << std::endl;
+}
+
+void Renderer::createColoredGrid() {
     // Grid parameters
-    const int gridSize = 10; // 10x10 grid
+    const int gridSize = mapDataLoaded_ ? std::max(mapData_.width, mapData_.height) : 10;
     const float gridSpacing = 0.4f; // Space between grid lines
     const float gridExtent = gridSize * gridSpacing * 0.5f; // Half the total grid size
     
-    std::vector<Vertex> vertices;
-    std::vector<Index> indices;
+    std::vector<Vertex> lineVertices;
+    std::vector<Index> lineIndices;
+    std::vector<Vertex> triangleVertices;
+    std::vector<Index> triangleIndices;
+    std::vector<TexturedVertex> texturedVertices;
+    std::vector<Index> texturedIndices;
     
-    // White color for grid lines
+    // Default white color for grid lines
     Vector3 gridColor = {1.0f, 1.0f, 1.0f};
     
-    // Create vertical lines
-    for (int i = 0; i <= gridSize; i++) {
-        float x = -gridExtent + i * gridSpacing;
+    if (mapDataLoaded_) {
+        aout << "Creating colored grid with map data: " << mapData_.width << "x" << mapData_.height << std::endl;
         
-        // Add vertices for vertical line
-        vertices.emplace_back(Vector3{x, -gridExtent, 0}, gridColor);
-        vertices.emplace_back(Vector3{x, gridExtent, 0}, gridColor);
+        // Create grid cells based on map data
+        for (int y = 0; y < mapData_.height; y++) {
+            for (int x = 0; x < mapData_.width; x++) {
+                char cellType = mapData_.data[y * mapData_.width + x];
+                Vector3 cellColor = {0.5f, 0.5f, 0.5f}; // Default gray
+                
+                // Color code based on cell content
+                switch (cellType) {
+                    case 'x':
+                    case 'X':
+                        cellColor = {1.0f, 0.0f, 0.0f}; // Red for tank positions
+                        break;
+                    case '1':
+                        cellColor = {0.0f, 1.0f, 0.0f}; // Green
+                        break;
+                    case '2':
+                        cellColor = {0.0f, 0.0f, 1.0f}; // Blue
+                        break;
+                    case '3':
+                        cellColor = {1.0f, 1.0f, 0.0f}; // Yellow
+                        break;
+                    case ' ':
+                    default:
+                        cellColor = {0.2f, 0.2f, 0.2f}; // Dark gray for empty
+                        break;
+                }
+                
+                // Calculate cell position
+                float cellX = -gridExtent + (x + 0.5f) * gridSpacing;
+                float cellY = gridExtent - (y + 0.5f) * gridSpacing;
+                float cellSize = gridSpacing * 0.8f; // Make cells slightly smaller than grid spacing
+                
+                // For tank positions, create textured quads; for others, just outline
+                if (cellType == 'x' || cellType == 'X') {
+                    // Create a textured quad for tank position
+                    Index baseIndex = texturedVertices.size();
+                    
+                    // Add vertices with texture coordinates for tank texture
+                    texturedVertices.emplace_back(Vector3{cellX - cellSize/2, cellY + cellSize/2, 0}, Vector2{0.0f, 0.0f}); // Top-left
+                    texturedVertices.emplace_back(Vector3{cellX + cellSize/2, cellY + cellSize/2, 0}, Vector2{1.0f, 0.0f}); // Top-right
+                    texturedVertices.emplace_back(Vector3{cellX + cellSize/2, cellY - cellSize/2, 0}, Vector2{1.0f, 1.0f}); // Bottom-right
+                    texturedVertices.emplace_back(Vector3{cellX - cellSize/2, cellY - cellSize/2, 0}, Vector2{0.0f, 1.0f}); // Bottom-left
+                    
+                    // Add triangle indices for textured quad (two triangles)
+                    texturedIndices.push_back(baseIndex);     texturedIndices.push_back(baseIndex + 1); texturedIndices.push_back(baseIndex + 2); // First triangle
+                    texturedIndices.push_back(baseIndex);     texturedIndices.push_back(baseIndex + 2); texturedIndices.push_back(baseIndex + 3); // Second triangle
+                } else {
+                    // Create outline for other cell types
+                    Index baseIndex = lineVertices.size();
+                    
+                    // Add vertices for cell corners
+                    lineVertices.emplace_back(Vector3{cellX - cellSize/2, cellY + cellSize/2, 0}, cellColor); // Top-left
+                    lineVertices.emplace_back(Vector3{cellX + cellSize/2, cellY + cellSize/2, 0}, cellColor); // Top-right
+                    lineVertices.emplace_back(Vector3{cellX + cellSize/2, cellY - cellSize/2, 0}, cellColor); // Bottom-right
+                    lineVertices.emplace_back(Vector3{cellX - cellSize/2, cellY - cellSize/2, 0}, cellColor); // Bottom-left
+                    
+                    // Add indices for cell outline (4 lines)
+                    lineIndices.push_back(baseIndex);     lineIndices.push_back(baseIndex + 1); // Top
+                    lineIndices.push_back(baseIndex + 1); lineIndices.push_back(baseIndex + 2); // Right
+                    lineIndices.push_back(baseIndex + 2); lineIndices.push_back(baseIndex + 3); // Bottom
+                    lineIndices.push_back(baseIndex + 3); lineIndices.push_back(baseIndex);     // Left
+                }
+            }
+        }
+    } else {
+        // Create basic white grid lines as before
+        aout << "Creating basic grid (no map data)" << std::endl;
         
-        // Add indices for this line
-        Index baseIndex = (i * 2);
-        indices.push_back(baseIndex);
-        indices.push_back(baseIndex + 1);
-    }
-    
-    // Create horizontal lines
-    for (int i = 0; i <= gridSize; i++) {
-        float y = -gridExtent + i * gridSpacing;
+        // Create vertical lines
+        for (int i = 0; i <= gridSize; i++) {
+            float x = -gridExtent + i * gridSpacing;
+            
+            // Add vertices for vertical line
+            lineVertices.emplace_back(Vector3{x, -gridExtent, 0}, gridColor);
+            lineVertices.emplace_back(Vector3{x, gridExtent, 0}, gridColor);
+            
+            // Add indices for this line
+            Index baseIndex = (i * 2);
+            lineIndices.push_back(baseIndex);
+            lineIndices.push_back(baseIndex + 1);
+        }
         
-        // Add vertices for horizontal line
-        vertices.emplace_back(Vector3{-gridExtent, y, 0}, gridColor);
-        vertices.emplace_back(Vector3{gridExtent, y, 0}, gridColor);
-        
-        // Add indices for this line
-        Index baseIndex = ((gridSize + 1) * 2) + (i * 2);
-        indices.push_back(baseIndex);
-        indices.push_back(baseIndex + 1);
+        // Create horizontal lines
+        for (int i = 0; i <= gridSize; i++) {
+            float y = -gridExtent + i * gridSpacing;
+            
+            // Add vertices for horizontal line
+            lineVertices.emplace_back(Vector3{-gridExtent, y, 0}, gridColor);
+            lineVertices.emplace_back(Vector3{gridExtent, y, 0}, gridColor);
+            
+            // Add indices for this line
+            Index baseIndex = ((gridSize + 1) * 2) + (i * 2);
+            lineIndices.push_back(baseIndex);
+            lineIndices.push_back(baseIndex + 1);
+        }
     }
 
-    // Create a model and put it in the back of the render list.
-    models_.emplace_back(vertices, indices);
+    // Clear existing models
+    models_.clear();
+    triangleModels_.clear();
+    texturedModels_.clear();
+    highlightModels_.clear();
+
+    // Create models for lines if we have any
+    if (!lineVertices.empty()) {
+        models_.emplace_back(lineVertices, lineIndices);
+        aout << "Created line model with " << lineVertices.size() << " vertices and " << lineIndices.size() << " indices" << std::endl;
+    }
+    
+    // Create models for triangles if we have any  
+    if (!triangleVertices.empty()) {
+        triangleModels_.emplace_back(triangleVertices, triangleIndices);
+        aout << "Created triangle model with " << triangleVertices.size() << " vertices and " << triangleIndices.size() << " indices" << std::endl;
+    }
+    
+    // Create models for textured quads (tanks) if we have any
+    if (!texturedVertices.empty()) {
+        texturedModels_.emplace_back(texturedVertices, texturedIndices);
+        aout << "Created textured model with " << texturedVertices.size() << " vertices and " << texturedIndices.size() << " indices" << std::endl;
+    }
 }
 
 void Renderer::handleInput() {
@@ -327,9 +592,15 @@ void Renderer::handleInput() {
         auto x = GameActivityPointerAxes_getX(&pointer);
         auto y = GameActivityPointerAxes_getY(&pointer);
 
-        // Convert screen coordinates to normalized coordinates
-        float normalizedX = (x / float(width_)) * 2.0f - 1.0f;
-        float normalizedY = -((y / float(height_)) * 2.0f - 1.0f); // Flip Y axis
+        // Convert screen coordinates to world coordinates matching the orthographic projection
+        // The projection uses halfHeight = 2.0f, so Y range is [-2, 2]
+        // X range is [-2*aspect, 2*aspect] where aspect = width/height
+        float aspect = float(width_) / float(height_);
+        float halfHeight = kProjectionHalfHeight; // Use the same constant as projection
+        float halfWidth = halfHeight * aspect;
+        
+        float normalizedX = ((x / float(width_)) * 2.0f - 1.0f) * halfWidth;
+        float normalizedY = -(((y / float(height_)) * 2.0f - 1.0f) * halfHeight); // Flip Y axis
 
         // determine the action type and process the event accordingly.
         switch (action & AMOTION_EVENT_ACTION_MASK) {
@@ -338,6 +609,10 @@ void Renderer::handleInput() {
                 lastTouchX_ = normalizedX;
                 lastTouchY_ = normalizedY;
                 isScrolling_ = true;
+                
+                // Check for tank selection on touch down
+                checkTankSelection(normalizedX, normalizedY);
+                
                 aout << "Touch Down: (" << normalizedX << ", " << normalizedY << ")" << std::endl;
                 break;
 
@@ -354,9 +629,9 @@ void Renderer::handleInput() {
                     float deltaX = normalizedX - lastTouchX_;
                     float deltaY = normalizedY - lastTouchY_;
                     
-                    // Update scroll position
-                    scrollX_ += deltaX * 2.0f; // Scale factor for sensitivity
-                    scrollY_ += deltaY * 2.0f;
+                    // Update scroll position (no additional scaling needed since delta is already in world coordinates)
+                    scrollX_ += deltaX;
+                    scrollY_ += deltaY;
                     
                     // Update last touch position
                     lastTouchX_ = normalizedX;
@@ -394,4 +669,267 @@ void Renderer::handleInput() {
     }
     // clear the key input count too.
     android_app_clear_key_events(inputBuffer);
+}
+
+bool Renderer::decodePNGToTexture() {
+    if (tankImageData_.empty()) {
+        aout << "No tank image data to decode" << std::endl;
+        return false;
+    }
+    
+    aout << "Decoding PNG data using BitmapFactory, size: " << tankImageData_.size() << " bytes" << std::endl;
+    
+    JNIEnv* env = getJNIEnv();
+    if (!env) {
+        aout << "Failed to get JNI environment" << std::endl;
+        return false;
+    }
+    
+    // Create byte array from image data
+    jbyteArray byteArray = env->NewByteArray(tankImageData_.size());
+    if (!byteArray) {
+        aout << "Failed to create byte array" << std::endl;
+        return false;
+    }
+    
+    env->SetByteArrayRegion(byteArray, 0, tankImageData_.size(), 
+                           reinterpret_cast<const jbyte*>(tankImageData_.data()));
+    
+    // Get BitmapFactory class and decodeByteArray method
+    jclass bitmapFactoryClass = env->FindClass("android/graphics/BitmapFactory");
+    if (!bitmapFactoryClass) {
+        aout << "Failed to find BitmapFactory class" << std::endl;
+        env->DeleteLocalRef(byteArray);
+        return false;
+    }
+    
+    jmethodID decodeByteArrayMethod = env->GetStaticMethodID(bitmapFactoryClass, 
+                                                           "decodeByteArray", 
+                                                           "([BII)Landroid/graphics/Bitmap;");
+    if (!decodeByteArrayMethod) {
+        aout << "Failed to find decodeByteArray method" << std::endl;
+        env->DeleteLocalRef(byteArray);
+        env->DeleteLocalRef(bitmapFactoryClass);
+        return false;
+    }
+    
+    // Decode the image
+    jobject bitmap = env->CallStaticObjectMethod(bitmapFactoryClass, decodeByteArrayMethod, 
+                                                byteArray, 0, tankImageData_.size());
+    
+    if (!bitmap) {
+        aout << "Failed to decode bitmap" << std::endl;
+        env->DeleteLocalRef(byteArray);
+        env->DeleteLocalRef(bitmapFactoryClass);
+        return false;
+    }
+    
+    // Get bitmap info
+    AndroidBitmapInfo bitmapInfo;
+    int result = AndroidBitmap_getInfo(env, bitmap, &bitmapInfo);
+    if (result != ANDROID_BITMAP_RESULT_SUCCESS) {
+        aout << "Failed to get bitmap info, result: " << result << std::endl;
+        env->DeleteLocalRef(bitmap);
+        env->DeleteLocalRef(byteArray);
+        env->DeleteLocalRef(bitmapFactoryClass);
+        return false;
+    }
+    
+    tankTextureWidth_ = bitmapInfo.width;
+    tankTextureHeight_ = bitmapInfo.height;
+    
+    aout << "Tank image dimensions: " << tankTextureWidth_ << "x" << tankTextureHeight_ << std::endl;
+    
+    // Lock bitmap pixels
+    void* bitmapPixels;
+    result = AndroidBitmap_lockPixels(env, bitmap, &bitmapPixels);
+    if (result != ANDROID_BITMAP_RESULT_SUCCESS) {
+        aout << "Failed to lock bitmap pixels, result: " << result << std::endl;
+        env->DeleteLocalRef(bitmap);
+        env->DeleteLocalRef(byteArray);
+        env->DeleteLocalRef(bitmapFactoryClass);
+        return false;
+    }
+    
+    // Create OpenGL texture
+    glGenTextures(1, &tankTextureId_);
+    glBindTexture(GL_TEXTURE_2D, tankTextureId_);
+    
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    // Upload texture data - BitmapFactory typically returns RGBA_8888
+    GLenum format = (bitmapInfo.format == ANDROID_BITMAP_FORMAT_RGBA_8888) ? GL_RGBA : GL_RGB;
+    glTexImage2D(GL_TEXTURE_2D, 0, format, tankTextureWidth_, tankTextureHeight_, 0, 
+                format, GL_UNSIGNED_BYTE, bitmapPixels);
+    
+    glBindTexture(GL_TEXTURE_2D, 0);
+    
+    // Unlock bitmap pixels
+    AndroidBitmap_unlockPixels(env, bitmap);
+    
+    // Clean up JNI references
+    env->DeleteLocalRef(bitmap);
+    env->DeleteLocalRef(byteArray);
+    env->DeleteLocalRef(bitmapFactoryClass);
+    
+    tankTextureLoaded_ = true;
+    aout << "Tank texture created successfully using BitmapFactory, ID: " << tankTextureId_ << std::endl;
+    
+    return true;
+}
+
+JNIEnv* Renderer::getJNIEnv() {
+    JavaVM* jvm = app_->activity->vm;
+    JNIEnv* env = nullptr;
+    
+    jint result = jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (result == JNI_EDETACHED) {
+        // Thread not attached, attach it
+        result = jvm->AttachCurrentThread(&env, nullptr);
+        if (result != JNI_OK) {
+            aout << "Failed to attach current thread to JVM" << std::endl;
+            return nullptr;
+        }
+    } else if (result != JNI_OK) {
+        aout << "Failed to get JNI environment" << std::endl;
+        return nullptr;
+    }
+    
+    return env;
+}
+
+void Renderer::checkTankSelection(float worldX, float worldY) {
+    if (!mapDataLoaded_) {
+        return;
+    }
+    
+    // Input coordinates are already in world space, just account for scroll
+    float adjustedWorldX = worldX - scrollX_;
+    float adjustedWorldY = worldY - scrollY_;
+    
+    // Grid parameters (same as in createColoredGrid)
+    const int gridSize = std::max(mapData_.width, mapData_.height);
+    const float gridSpacing = 0.4f;
+    const float gridExtent = gridSize * gridSpacing * 0.5f;
+    
+    // Convert world coordinates to grid coordinates
+    // Reverse the formula used in createColoredGrid:
+    // cellX = -gridExtent + (x + 0.5f) * gridSpacing  =>  x = (cellX + gridExtent) / gridSpacing - 0.5
+    // cellY = gridExtent - (y + 0.5f) * gridSpacing   =>  y = (gridExtent - cellY) / gridSpacing - 0.5
+    float gridX = (adjustedWorldX + gridExtent) / gridSpacing - 0.5f;
+    float gridY = (gridExtent - adjustedWorldY) / gridSpacing - 0.5f;
+    
+    // Convert to integer grid coordinates with proper rounding
+    int gx = (int)round(gridX);
+    int gy = (int)round(gridY);
+    
+    aout << "Touch conversion: world(" << worldX << ", " << worldY << ") -> adjusted(" << adjustedWorldX << ", " << adjustedWorldY << ") -> grid_float(" << gridX << ", " << gridY << ") -> grid_int(" << gx << ", " << gy << ")" << std::endl;
+    aout << "Grid extent: " << gridExtent << ", Grid spacing: " << gridSpacing << ", Scroll: (" << scrollX_ << ", " << scrollY_ << ")" << std::endl;
+    
+    // Debug: show expected cell center for this grid position
+    if (gx >= 0 && gx < mapData_.width && gy >= 0 && gy < mapData_.height) {
+        float expectedCellX = -gridExtent + (gx + 0.5f) * gridSpacing;
+        float expectedCellY = gridExtent - (gy + 0.5f) * gridSpacing;
+        aout << "Expected cell center for grid(" << gx << "," << gy << "): world(" << expectedCellX << ", " << expectedCellY << ")" << std::endl;
+    }
+    
+    // Check if coordinates are within grid bounds
+    if (gx >= 0 && gx < mapData_.width && gy >= 0 && gy < mapData_.height) {
+        char cellType = mapData_.data[gy * mapData_.width + gx];
+        
+        aout << "=== GRID CELL ANALYSIS ===" << std::endl;
+        aout << "Grid position: (" << gx << ", " << gy << ")" << std::endl;
+        aout << "Cell type: '" << cellType << "' (ASCII: " << (int)cellType << ")" << std::endl;
+        aout << "Map dimensions: " << mapData_.width << "x" << mapData_.height << std::endl;
+        aout << "Array index: " << (gy * mapData_.width + gx) << " of " << mapData_.data.size() << std::endl;
+        
+        if (cellType == 'x' || cellType == 'X') {
+            // Tank found! Select it
+            selectedTankX_ = gx;
+            selectedTankY_ = gy;
+            hasTankSelected_ = true;
+            
+            aout << "*** TANK SELECTED! ***" << std::endl;
+            aout << "Selected tank at grid position (" << gx << ", " << gy << ")" << std::endl;
+            aout << "Previous selection: " << (hasTankSelected_ ? "Yes" : "No") << std::endl;
+            
+            // Create highlight overlay for selected tank
+            createHighlightOverlay();
+        } else {
+            // No tank at this position, clear selection
+            aout << "No tank found - clearing selection" << std::endl;
+            aout << "Expected 'x' or 'X', got '" << cellType << "'" << std::endl;
+            hasTankSelected_ = false;
+            highlightModels_.clear(); // Clear highlight overlay
+            aout << "No tank at grid position (" << gx << ", " << gy << "), cell type: '" << cellType << "'" << std::endl;
+        }
+    } else {
+        // Outside grid bounds, clear selection
+        aout << "=== OUT OF BOUNDS ===" << std::endl;
+        aout << "Grid position: (" << gx << ", " << gy << ")" << std::endl;
+        aout << "Grid bounds: 0-" << (mapData_.width-1) << " x 0-" << (mapData_.height-1) << std::endl;
+        hasTankSelected_ = false;
+        highlightModels_.clear(); // Clear highlight overlay
+        aout << "Touch outside grid bounds" << std::endl;
+    }
+}
+
+void Renderer::createHighlightOverlay() {
+    aout << "=== CREATING HIGHLIGHT OVERLAY ===" << std::endl;
+    aout << "Has tank selected: " << (hasTankSelected_ ? "YES" : "NO") << std::endl;
+    
+    if (!hasTankSelected_) {
+        highlightModels_.clear();
+        aout << "No tank selected - clearing highlight models" << std::endl;
+        return;
+    }
+    
+    aout << "Selected tank position: (" << selectedTankX_ << ", " << selectedTankY_ << ")" << std::endl;
+    
+    // Grid parameters (same as in createColoredGrid)
+    const int gridSize = std::max(mapData_.width, mapData_.height);
+    const float gridSpacing = 0.4f;
+    const float gridExtent = gridSize * gridSpacing * 0.5f;
+    const float cellSize = gridSpacing * 0.8f;
+    
+    // Calculate position of selected tank
+    float cellX = -gridExtent + (selectedTankX_ + 0.5f) * gridSpacing;
+    float cellY = gridExtent - (selectedTankY_ + 0.5f) * gridSpacing;
+    
+    // Create red highlight overlay (slightly larger than the tank)
+    float highlightSize = cellSize * 1.1f; // 10% larger for visible border
+    Vector3 highlightColor = {1.0f, 0.0f, 0.0f}; // Red
+    
+    std::vector<Vertex> highlightVertices;
+    std::vector<Index> highlightIndices;
+    
+    // Create highlight border (outline only)
+    Index baseIndex = highlightVertices.size();
+    
+    // Add vertices for highlight border
+    highlightVertices.emplace_back(Vector3{cellX - highlightSize/2, cellY + highlightSize/2, 0.01f}, highlightColor); // Top-left (slightly above)
+    highlightVertices.emplace_back(Vector3{cellX + highlightSize/2, cellY + highlightSize/2, 0.01f}, highlightColor); // Top-right
+    highlightVertices.emplace_back(Vector3{cellX + highlightSize/2, cellY - highlightSize/2, 0.01f}, highlightColor); // Bottom-right
+    highlightVertices.emplace_back(Vector3{cellX - highlightSize/2, cellY - highlightSize/2, 0.01f}, highlightColor); // Bottom-left
+    
+    // Add indices for highlight outline (thick lines)
+    highlightIndices.push_back(baseIndex);     highlightIndices.push_back(baseIndex + 1); // Top
+    highlightIndices.push_back(baseIndex + 1); highlightIndices.push_back(baseIndex + 2); // Right  
+    highlightIndices.push_back(baseIndex + 2); highlightIndices.push_back(baseIndex + 3); // Bottom
+    highlightIndices.push_back(baseIndex + 3); highlightIndices.push_back(baseIndex);     // Left
+    
+    // Clear and create new highlight model
+    highlightModels_.clear();
+    if (!highlightVertices.empty()) {
+        highlightModels_.emplace_back(highlightVertices, highlightIndices);
+        aout << "Created highlight overlay for tank at (" << selectedTankX_ << ", " << selectedTankY_ << ")" << std::endl;
+        aout << "Highlight model: " << highlightVertices.size() << " vertices, " << highlightIndices.size() << " indices" << std::endl;
+        aout << "Highlight position: (" << cellX << ", " << cellY << "), size: " << highlightSize << std::endl;
+    } else {
+        aout << "ERROR: No highlight vertices created!" << std::endl;
+    }
+    aout << "=== END HIGHLIGHT CREATION ===" << std::endl;
 }

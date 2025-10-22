@@ -12,8 +12,10 @@ add_library(scroller SHARED
         AndroidOut.cpp
         Renderer.cpp
         Shader.cpp
+        TextureShader.cpp
         TextureAsset.cpp
-        Utility.cpp)
+        Utility.cpp
+        NetworkDownloader.cpp)
 
 # Searches for a package provided by the game activity dependency
 find_package(game-activity REQUIRED CONFIG)

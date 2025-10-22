@@ -59,6 +59,12 @@ public:
     void drawModel(const Model &model) const;
 
     /*!
+     * Renders a single model as triangles
+     * @param model a model to render
+     */
+    void drawTriangles(const Model &model) const;
+
+    /*!
      * Sets the model matrix in the shader.
      * @param modelMatrix sixteen floats, column major, defining an OpenGL model matrix.
      */

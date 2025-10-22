@@ -6,6 +6,9 @@
 #include "AndroidOut.h"
 #include "Renderer.h"
 
+// Global app pointer for JNI access
+struct android_app* g_app = nullptr;
+
 extern "C" {
 
 /*!
@@ -58,6 +61,9 @@ bool motion_event_filter_func(const GameActivityMotionEvent *motionEvent) {
  * This the main entry point for a native activity
  */
 void android_main(struct android_app *pApp) {
+    // Set global app pointer for JNI access
+    g_app = pApp;
+    
     // Can be removed, useful to ensure your code is running
     aout << "Welcome to android_main" << std::endl;
 

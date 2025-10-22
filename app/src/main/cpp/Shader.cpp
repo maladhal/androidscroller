@@ -149,6 +149,36 @@ void Shader::drawModel(const Model &model) const {
     glDisableVertexAttribArray(position_);
 }
 
+void Shader::drawTriangles(const Model &model) const {
+    // The position attribute is 3 floats
+    glVertexAttribPointer(
+            position_, // attrib
+            3, // elements
+            GL_FLOAT, // of type float
+            GL_FALSE, // don't normalize
+            sizeof(Vertex), // stride is Vertex bytes
+            model.getVertexData() // pull from the start of the vertex data
+    );
+    glEnableVertexAttribArray(position_);
+
+    // The color attribute is 3 floats
+    glVertexAttribPointer(
+            color_, // attrib
+            3, // elements
+            GL_FLOAT, // of type float
+            GL_FALSE, // don't normalize
+            sizeof(Vertex), // stride is Vertex bytes
+            ((uint8_t *) model.getVertexData()) + sizeof(Vector3) // offset Vector3 from the start
+    );
+    glEnableVertexAttribArray(color_);
+
+    // Draw as indexed triangles
+    glDrawElements(GL_TRIANGLES, model.getIndexCount(), GL_UNSIGNED_SHORT, model.getIndexData());
+
+    glDisableVertexAttribArray(color_);
+    glDisableVertexAttribArray(position_);
+}
+
 void Shader::setModelMatrix(float *modelMatrix) const {
     glUniformMatrix4fv(modelMatrix_, 1, false, modelMatrix);
 }

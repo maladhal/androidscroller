@@ -26,6 +26,14 @@ struct Vertex {
 
     Vector3 position;
     Vector3 color;
+};
+
+struct TexturedVertex {
+    constexpr TexturedVertex(const Vector3 &inPosition, const Vector2 &inTexCoord) : position(inPosition),
+                                                                                     texCoord(inTexCoord) {}
+
+    Vector3 position;
+    Vector2 texCoord;
 };;
 
 typedef uint16_t Index;
@@ -52,6 +60,31 @@ public:
 
 private:
     std::vector<Vertex> vertices_;
+    std::vector<Index> indices_;
+};
+
+class TexturedModel {
+public:
+    inline TexturedModel(
+            std::vector<TexturedVertex> vertices,
+            std::vector<Index> indices)
+            : vertices_(std::move(vertices)),
+              indices_(std::move(indices)) {}
+
+    inline const TexturedVertex *getVertexData() const {
+        return vertices_.data();
+    }
+
+    inline const size_t getIndexCount() const {
+        return indices_.size();
+    }
+
+    inline const Index *getIndexData() const {
+        return indices_.data();
+    }
+
+private:
+    std::vector<TexturedVertex> vertices_;
     std::vector<Index> indices_;
 };
 

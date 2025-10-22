@@ -1,5 +1,6 @@
 package com.example.scroller;
 
+import android.os.Bundle;
 import android.view.View;
 
 import com.google.androidgamesdk.GameActivity;
@@ -7,6 +8,13 @@ import com.google.androidgamesdk.GameActivity;
 public class MainActivity extends GameActivity {
     static {
         System.loadLibrary("scroller");
+    }
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        // Set context for NetworkHelper
+        NetworkHelper.setContext(this);
     }
 
     @Override
